@@ -70,6 +70,9 @@ bot_logger = logging.getLogger("constella.bot")
 rpc_logger = logging.getLogger("constella.rpc")
 vpn_logger = logging.getLogger("constella.vpn")
 
+# Quiet down noisy HTTP access logs; application logs carry the signal we need.
+logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
+
 
 def _extract_port(addr: str, default: int = 4747) -> int:
     try:
@@ -370,19 +373,71 @@ def set_state(k: str, v: Any):
     save_json(STATE_FILE, state)
 
 def upsert_peer(p: Dict[str, Any]):
-    if not p.get("node_id"): return
-    cur = peers.get(p["node_id"], {})
-    cur.update(p)
-    peers[p["node_id"]] = cur
-    # синхронизируем в state.peers
-    found = False
-    for item in state["peers"]:
-        if item.get("node_id") == p["node_id"]:
-            item.update(cur)
-            found = True
-            break
-    if not found:
-        state["peers"].append(cur.copy())
+    """
+    Update peer tables while preventing "ghost" entries with empty node_id.
+
+    We prefer to key peers by node_id. Temporary records that arrive without
+    node_id are allowed but deduplicated by address; once node_id is known we
+    rewrite any placeholder entries so a single record remains.
+    """
+
+    addr = p.get("addr")
+    node_id = (p.get("node_id") or "").strip()
+    if not addr:
+        return
+
+    # Reuse a known node_id for this address if present to avoid duplicates.
+    if not node_id:
+        for existing in peers.values():
+            if existing.get("addr") == addr and existing.get("node_id"):
+                node_id = existing["node_id"]
+                p["node_id"] = node_id
+                break
+        if not node_id:
+            for existing in state.get("peers", []):
+                if existing.get("addr") == addr and existing.get("node_id"):
+                    node_id = existing["node_id"]
+                    p["node_id"] = node_id
+                    break
+
+    # Drop obsolete placeholder entries for this address when we learn node_id.
+    cleaned_peers = []
+    for item in state.get("peers", []):
+        if node_id and item.get("addr") == addr and not item.get("node_id"):
+            continue
+        cleaned_peers.append(item)
+    state["peers"] = cleaned_peers
+
+    if node_id:
+        cur = peers.get(node_id, {})
+        cur.update(p)
+        peers[node_id] = cur
+        found = False
+        for item in state["peers"]:
+            if item.get("node_id") == node_id:
+                item.update(cur)
+                found = True
+                break
+        if not found:
+            state["peers"].append(cur.copy())
+    else:
+        # Keep a single placeholder per address until node_id is discovered.
+        placeholder = {
+            "name": p.get("name") or addr,
+            "addr": addr,
+            "node_id": "",
+            "status": p.get("status", "unknown"),
+            "last_seen": p.get("last_seen", 0),
+        }
+        found = False
+        for item in state["peers"]:
+            if item.get("addr") == addr and not item.get("node_id"):
+                item.update(placeholder)
+                found = True
+                break
+        if not found:
+            state["peers"].append(placeholder)
+
     save_json(STATE_FILE, state)
 
 def is_peer_online(last_seen: Optional[int], *, now: Optional[int] = None) -> bool:
@@ -779,6 +834,8 @@ async def rpc(req):
 # --- RPC client helpers ----------------------------------------------------------
 
 async def call_rpc(addr: str, method: str, params: Dict[str, Any], *, timeout: Optional[float] = None) -> Dict[str, Any]:
+    if not addr:
+        return {"ok": False, "error": "rpc_error:missing_addr"}
     if not state.get("network_secret"):
         return {"ok": False, "error": "no_network_secret"}
     payload = {"method": method, "params": params, "ts": now_s()}
@@ -813,6 +870,60 @@ async def lease_release_from(coord_addr: str, owner: str) -> Dict[str, Any]:
 
 async def bot_takeover(addr: str, owner: str, until: int) -> Dict[str, Any]:
     return await call_rpc(addr, "Bot.Takeover", {"owner": owner, "until": until})
+
+
+def _lease_normalized(resp: Dict[str, Any], *, fallback_owner: str = "", fallback_until: int = 0) -> Dict[str, Any]:
+    """Ensure lease responses always have owner/until fields."""
+
+    owner = resp.get("owner", fallback_owner) or ""
+    until_raw = resp.get("until", fallback_until)
+    try:
+        until = int(until_raw or 0)
+    except (TypeError, ValueError):
+        until = int(fallback_until or 0)
+    resp = dict(resp)
+    resp["owner"] = owner
+    resp["until"] = until
+    return resp
+
+
+async def lease_get(coord: Dict[str, Any]) -> Dict[str, Any]:
+    """Fetch lease state from coordinator, using local state if we are it."""
+
+    if not coord:
+        return _lease_normalized({"ok": False, "error": "no_coordinator"})
+    if coord.get("node_id") == NODE_ID:
+        owner, until = get_bot_lease()
+        return {"ok": True, "owner": owner, "until": until}
+    return _lease_normalized(await lease_get_from(coord.get("addr", "")))
+
+
+async def lease_acquire(coord: Dict[str, Any], owner: str, ttl: int) -> Dict[str, Any]:
+    """Acquire/renew lease via coordinator, locally when self is the coordinator."""
+
+    nowt = now_s()
+    if not coord:
+        return _lease_normalized({"ok": False, "error": "no_coordinator"})
+    if coord.get("node_id") == NODE_ID:
+        current_owner, current_until = get_bot_lease()
+        if not current_owner or current_until <= nowt or current_owner == owner:
+            set_bot_lease(owner, nowt + ttl)
+            return {"ok": True, "owner": owner, "until": nowt + ttl}
+        return {"ok": False, "owner": current_owner, "until": current_until}
+    return _lease_normalized(await lease_acquire_from(coord.get("addr", ""), owner, ttl))
+
+
+async def lease_release(coord: Dict[str, Any], owner: str) -> Dict[str, Any]:
+    """Release lease via coordinator or locally when we coordinate."""
+
+    if not coord:
+        return {"ok": False, "error": "no_coordinator"}
+    if coord.get("node_id") == NODE_ID:
+        cur_owner, cur_until = get_bot_lease()
+        if cur_owner == owner or cur_until <= now_s():
+            set_bot_lease("", 0)
+        return {"ok": True, "owner": cur_owner, "until": cur_until}
+    return _lease_normalized(await lease_release_from(coord.get("addr", ""), owner))
 
 
 # --- Lease coordination & leader election ----------------------------------------
@@ -958,19 +1069,48 @@ def peer_status_icon(status: str) -> str:
 
 
 def peers_with_status() -> List[Dict[str, Any]]:
-    # объединяем известных пиров и себя; статусы считаем на лету
-    merged = {p.get("node_id", ""): dict(p) for p in state.get("peers", [])}
-    merged[NODE_ID] = dict(self_peer)
+    """
+    Merge known peers (persistent + self) and compute liveness on the fly.
+
+    Deduplication happens by node_id when it is known, otherwise by addr so a
+    temporary placeholder does not create a "ghost" peer once the real node_id
+    arrives.
+    """
+
+    merged: Dict[str, Dict[str, Any]] = {}
     now = now_s()
+
+    def merge_one(peer: Dict[str, Any]):
+        node_id = (peer.get("node_id") or "").strip()
+        addr = peer.get("addr") or ""
+        key = node_id or f"addr:{addr}"
+        if not key:
+            return
+        existing = merged.get(key, {})
+        existing.update(peer)
+        if node_id:
+            existing["node_id"] = node_id
+        merged[key] = existing
+
+    for p in state.get("peers", []):
+        merge_one(dict(p))
+    merge_one(dict(self_peer))
+
     out = []
-    for nid, p in merged.items():
+    for _, p in merged.items():
         q = dict(p)
-        q.setdefault("node_id", nid)
+        if not q.get("node_id") and q.get("addr"):
+            # Try to backfill node_id from canonical peers mapping
+            for nid, live in peers.items():
+                if live.get("addr") == q.get("addr") and nid:
+                    q["node_id"] = nid
+                    break
         name = q.get("name") or q.get("addr") or (q.get("node_id") or "")[:8] or "?"
         q["name"] = name
         q["status"] = peer_status(q, now=now)
         q["status_emoji"] = peer_status_icon(q["status"])
         out.append(q)
+
     return out
 
 # --- Network bootstrap (JOIN flow) -----------------------------------------------
@@ -1870,8 +2010,8 @@ async def start_bot():
                         lease_owner, lease_until = owner, until
                         try:
                             coord = lease_coordinator_peer()
-                            if coord and coord.get("addr"):
-                                info = await lease_get_from(coord["addr"])
+                            if coord:
+                                info = await lease_get(coord)
                                 if info.get("ok"):
                                     lease_owner = info.get("owner", lease_owner)
                                     lease_until = int(info.get("until", lease_until) or 0)
@@ -1974,12 +2114,17 @@ async def leader_watcher():
         coord = lease_coordinator_peer()
         owner, until = get_bot_lease()
         nowt = now_s()
-        if coord and coord.get("addr"):
-            info = await lease_get_from(coord["addr"])
+        if coord:
+            info = await lease_get(coord)
             if info.get("ok"):
                 owner = info.get("owner", owner)
                 until = int(info.get("until", until) or 0)
                 set_bot_lease(owner or "", until)
+            else:
+                rpc_logger.warning(
+                    "Lease.Get failed",
+                    extra={"server": SERVER_NAME, "coord": coord.get("addr"), "error": info.get("error")},
+                )
 
         running = bot_task_running()
         if running and (not am or owner != NODE_ID or until <= nowt):
@@ -1995,9 +2140,9 @@ async def leader_watcher():
 
         if not am:
             if was_leader:
-                print(f"[leader] lost leadership to {L.get('name')} ({L.get('node_id','')[:8]})")
-                if coord and coord.get("addr") and owner == NODE_ID:
-                    await lease_release_from(coord["addr"], NODE_ID)
+                print(f"[leader] lost leadership to {L.get('name')} ({L.get('node_id', '')[:8]})")
+                if coord and owner == NODE_ID:
+                    await lease_release(coord, NODE_ID)
                 if owner == NODE_ID:
                     set_bot_lease("", 0)
             was_leader = False
@@ -2021,15 +2166,22 @@ async def leader_watcher():
         if owner != NODE_ID or until <= nowt:
             previous_owner = owner
             acquired = False
-            if coord and coord.get("addr"):
-                got = await lease_acquire_from(coord["addr"], NODE_ID, BOT_LEASE_TTL)
-                if got.get("ok"):
-                    owner = got.get("owner", NODE_ID)
-                    until = int(got.get("until", nowt + BOT_LEASE_TTL))
-                    acquired = owner == NODE_ID
+            if coord:
+                got = await lease_acquire(coord, NODE_ID, BOT_LEASE_TTL)
+                owner = got.get("owner", owner)
+                until = int(got.get("until", until) or 0)
+                if got.get("ok") and owner == NODE_ID:
+                    acquired = True
+                elif not got.get("ok") and (not owner or until <= nowt):
+                    rpc_logger.warning(
+                        "Lease acquisition returned no active owner; assuming free",
+                        extra={"server": SERVER_NAME, "coord": coord.get("addr"), "error": got.get("error")},
+                    )
+                    owner = NODE_ID
+                    until = nowt + BOT_LEASE_TTL
+                    set_bot_lease(owner, until)
+                    acquired = True
                 else:
-                    owner = got.get("owner", owner)
-                    until = int(got.get("until", until) or 0)
                     set_bot_lease(owner, until)
                     print(f"[leader] lease denied: owner={got.get('owner','')[:8]} until={got.get('until')}")
             else:
@@ -2051,13 +2203,13 @@ async def leader_watcher():
         else:
             if until - nowt < BOT_LEASE_TTL // 2:
                 refreshed = False
-                if coord and coord.get("addr"):
-                    got = await lease_acquire_from(coord["addr"], NODE_ID, BOT_LEASE_TTL)
+                if coord:
+                    got = await lease_acquire(coord, NODE_ID, BOT_LEASE_TTL)
                     if got.get("ok"):
                         until = int(got.get("until", until))
                         refreshed = True
                     else:
-                        print(f"[lease] renew denied by {got.get('owner','')[:8]} until={got.get('until')}")
+                        print(f"[lease] renew denied by {got.get('owner', '')[:8]} until={got.get('until')}")
                 else:
                     until = nowt + BOT_LEASE_TTL
                     refreshed = True
@@ -2122,7 +2274,7 @@ def main():
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
     host, port = parse_listen(LISTEN_ADDR)
-    web.run_app(app, host=host, port=port)
+    web.run_app(app, host=host, port=port, access_log=None)
 
 if __name__ == "__main__":
     main()
