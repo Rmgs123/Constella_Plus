@@ -242,6 +242,14 @@ apt install -y wireguard wireguard-tools
   --vpn-cidr 10.42.0.0/24 \
   --vpn-listen-port 51820 \
   --vpn-address 10.42.0.1/24
+
+(После установки клиента - добавить)
+nano state/wg/wg0.conf
+
+[Peer]
+PublicKey = MzorjlCwWxKEnx0sgyfEdWP2l/M4rh7slI9eP0l31SA=
+AllowedIPs = 10.42.0.2/32
+PersistentKeepalive = 25
 ```
 
 Скрипт создаст `state/wg/wg0.conf`, сгенерирует ключи и выведет публичный ключ хаба; добавляйте клиентов вручную в `[Peer]`.
