@@ -189,8 +189,8 @@ WireGuard-overlay позволяет прокидывать трафик Constel
 ### 1. Первый (seed) публичный узел
 
 ```bash
-git clone https://github.com/Rmgs123/Constella.git
-cd Constella
+git clone https://github.com/Rmgs123/Constella_Plus.git
+cd Constella_Plus
 
 ./install.sh init \
   --server-name delta-01 \
@@ -207,8 +207,8 @@ docker compose logs -f
 ### 2. Второй публичный узел (ещё один VPS)
 
 ```bash
-git clone https://github.com/Rmgs123/Constella.git
-cd Constella
+git clone https://github.com/Rmgs123/Constella_Plus.git
+cd Constella_Plus
 
 ./install.sh join \
   --server-name echo-02 \
@@ -298,7 +298,7 @@ docker volume prune
 docker system prune -a --volumes
 
 cd ..
-rm -rf Constella                 # удалит state/ и всю сетевую информацию
+rm -rf Constella_Plus             # удалит state/ и всю сетевую информацию
 ```
 
 > ⚠️ Удаление каталога `state/` уничтожает `network_secret`, `node_id`, invites и WireGuard-конфиги — сеть придётся инициализировать заново.
