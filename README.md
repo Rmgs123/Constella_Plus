@@ -192,6 +192,8 @@ WireGuard-overlay позволяет прокидывать трафик Constel
 git clone https://github.com/Rmgs123/Constella_Plus.git
 cd Constella_Plus
 
+chmod +x install.sh
+
 ./install.sh init \
   --server-name delta-01 \
   --public-addr 203.0.113.10:4747 \
@@ -209,6 +211,8 @@ docker compose logs -f
 ```bash
 git clone https://github.com/Rmgs123/Constella_Plus.git
 cd Constella_Plus
+
+chmod +x install.sh
 
 ./install.sh join \
   --server-name echo-02 \
