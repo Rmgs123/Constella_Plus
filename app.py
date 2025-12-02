@@ -46,6 +46,9 @@ SEED_PEERS = [p.strip() for p in os.environ.get("SEED_PEERS", "").split(",") if 
 VPN_MODE = os.environ.get("VPN_MODE", "none").strip().lower()
 VPN_INTERFACE_NAME = os.environ.get("VPN_INTERFACE_NAME", "wg0")
 VPN_CIDR = os.environ.get("VPN_CIDR", "10.42.0.0/24")
+VPN_ADDRESS = os.environ.get("VPN_ADDRESS", "")
+VPN_HUB_ENDPOINT = os.environ.get("VPN_HUB_ENDPOINT", "")
+VPN_OVERLAY_TRUST_HOST = os.environ.get("VPN_OVERLAY_TRUST_HOST", "0") == "1"
 
 SAMPLE_EVERY_SEC = int(os.environ.get("SAMPLE_EVERY_SEC", "300"))  # 5 мин
 METRICS_WINDOW_H = int(os.environ.get("METRICS_WINDOW_H", "6"))    # последние 6 часов
@@ -69,6 +72,7 @@ logger = logging.getLogger("constella")
 bot_logger = logging.getLogger("constella.bot")
 rpc_logger = logging.getLogger("constella.rpc")
 vpn_logger = logging.getLogger("constella.vpn")
+join_logger = logging.getLogger("constella.join")
 
 # Quiet down noisy HTTP access logs; application logs carry the signal we need.
 logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
@@ -82,7 +86,12 @@ def _extract_port(addr: str, default: int = 4747) -> int:
 
 
 def detect_vpn_ip() -> Optional[str]:
-    """Return VPN overlay IPv4 address when interface is available."""
+    """Return VPN overlay IPv4 address when interface is available or trusted.
+
+    In containerised deployments the WireGuard interface can live on the host
+    namespace. In that case the interface is invisible here, so we allow a
+    fallback to the configured VPN_ADDRESS when explicitly trusted by the user.
+    """
 
     try:
         network = ipaddress.ip_network(VPN_CIDR, strict=False)
@@ -96,6 +105,17 @@ def detect_vpn_ip() -> Optional[str]:
     interfaces = psutil.net_if_addrs()
     addrs = interfaces.get(VPN_INTERFACE_NAME)
     if not addrs:
+        if VPN_OVERLAY_TRUST_HOST and VPN_ADDRESS:
+            try:
+                candidate = str(ipaddress.ip_interface(VPN_ADDRESS).ip)
+            except ValueError:
+                candidate = None
+            if candidate and ipaddress.ip_address(candidate) in network:
+                vpn_logger.info(
+                    "VPN overlay trusted from host network namespace",
+                    extra={"mode": VPN_MODE, "interface": VPN_INTERFACE_NAME, "cidr": VPN_CIDR, "address": candidate},
+                )
+                return candidate
         vpn_logger.warning(
             "VPN overlay enabled but interface missing",
             extra={"mode": VPN_MODE, "interface": VPN_INTERFACE_NAME},
@@ -141,10 +161,45 @@ if VPN_MODE and VPN_MODE != "none":
                 extra={"public_addr": PUBLIC_ADDR},
             )
     else:
-        vpn_logger.warning(
-            "VPN overlay requested but interface is not ready; falling back to default addressing",
-            extra={"mode": VPN_MODE, "interface": VPN_INTERFACE_NAME},
+        message = "VPN overlay requested but interface is not ready; falling back to default addressing"
+        level = vpn_logger.warning
+        if VPN_OVERLAY_TRUST_HOST and VPN_ADDRESS:
+            level = vpn_logger.info
+            message = (
+                "VPN overlay requested; using configured VPN_ADDRESS as trusted host overlay"
+            )
+        level(
+            message,
+            extra={"mode": VPN_MODE, "interface": VPN_INTERFACE_NAME, "cidr": VPN_CIDR, "vpn_address": VPN_ADDRESS},
         )
+
+
+def _derive_overlay_ip_from_config() -> Optional[str]:
+    if VPN_OVERLAY_IP:
+        return VPN_OVERLAY_IP
+    if VPN_ADDRESS:
+        try:
+            return str(ipaddress.ip_interface(VPN_ADDRESS).ip)
+        except ValueError:
+            return None
+    return None
+
+
+def advertised_addr() -> str:
+    """Best-effort public/overlay address to share with peers."""
+
+    # Highest priority: explicit PUBLIC_ADDR from the user
+    if PUBLIC_ADDR:
+        return PUBLIC_ADDR
+
+    # Next: VPN overlay address if present or derivable
+    overlay_ip = _derive_overlay_ip_from_config()
+    if overlay_ip:
+        port = _extract_port(LISTEN_ADDR)
+        return f"{overlay_ip}:{port}"
+
+    # Fallback: the listen address (may be routable in LAN-only setups)
+    return LISTEN_ADDR
 
 # Тайминги
 HEARTBEAT_INTERVAL = float(os.environ.get("HEARTBEAT_INTERVAL", "2.0"))
@@ -308,6 +363,9 @@ state = load_json(STATE_FILE, {
     "bot_lease": {"owner": "", "until": 0}
 })
 
+# Derived addressing used in peer announcements and join payloads
+ADVERTISED_ADDR = advertised_addr()
+
 # Outstanding invite tokens (for onboarding new peers)
 invites = load_json(INVITES_FILE, {
     "tokens": []  # [{token, exp_ts}]
@@ -325,7 +383,7 @@ else:
 
 # In-memory peer table keeps the freshest view for fast lookups
 peers: Dict[str, Dict[str, Any]] = {}
-self_peer = {"name": SERVER_NAME, "addr": PUBLIC_ADDR, "node_id": NODE_ID, "status": "alive", "last_seen": now_s()}
+self_peer = {"name": SERVER_NAME, "addr": ADVERTISED_ADDR, "node_id": NODE_ID, "status": "alive", "last_seen": now_s()}
 
 # Telegram globals
 BOT: Optional["Bot"] = None
@@ -587,51 +645,106 @@ async def join(req):
     JOIN: {name, token, network_id, public_addr}
     Ответ: {ok, reason?, network_id, owner_username, network_secret, peers[]}
     """
-    data = await req.json()
-    name = data.get("name","")
-    token = data.get("token","")
-    net = data.get("network_id","")
-    pub_addr = data.get("public_addr","")
+    try:
+        data = await req.json()
+    except Exception:
+        join_logger.warning("/join bad json", extra={"remote": req.remote})
+        return web.json_response({"ok": False, "reason": "invalid json"}, status=400)
 
-    if not name or not token or not net or not pub_addr:
-        return web.json_response({"ok": False, "reason": "bad request"}, status=400)
+    name = (data.get("name") or "").strip()
+    token = (data.get("token") or "").strip()
+    net = (data.get("network_id") or "").strip()
+    pub_addr = (data.get("public_addr") or "").strip()
+    node_id = (data.get("node_id") or "").strip()
+
+    missing = [k for k, v in {"name": name, "token": token, "network_id": net, "public_addr": pub_addr}.items() if not v]
+    if missing:
+        reason = f"missing fields: {','.join(missing)}"
+        join_logger.warning(
+            "join refused: %s",
+            reason,
+            extra={"remote": req.remote, "network_id": net, "token": token[:5] + "…"},
+        )
+        return web.json_response({"ok": False, "reason": reason}, status=400)
 
     if net != state.get("network_id"):
+        join_logger.warning(
+            "join refused: wrong network",
+            extra={"remote": req.remote, "expected": state.get("network_id"), "got": net},
+        )
         return web.json_response({"ok": False, "reason": "wrong network"}, status=403)
 
     # проверка токена
     nowt = now_s()
-    valid = False
     tokens = invites.get("tokens", [])
+    chosen = None
     keep = []
     for t in tokens:
-        if t["token"] == token and t["exp_ts"] >= nowt:
-            valid = True
-        else:
+        tok_val = t.get("token")
+        exp_ts = int(t.get("exp_ts", 0) or 0)
+        used_by = t.get("used_by")
+        if tok_val != token:
             keep.append(t)
+            continue
+        if used_by:
+            chosen = {"ok": False, "reason": "token already used"}
+            keep.append(t)
+            break
+        if exp_ts < nowt:
+            chosen = {"ok": False, "reason": "token expired"}
+            # drop expired token silently
+            continue
+        chosen = {"ok": True, "token": t}
+        keep.append(t)
+        break
     invites["tokens"] = keep
     save_json(INVITES_FILE, invites)
 
-    if not valid:
-        return web.json_response({"ok": False, "reason": "invalid/expired token"}, status=403)
+    if not chosen or not chosen.get("ok"):
+        reason = chosen.get("reason") if chosen else "unknown token"
+        join_logger.warning(
+            "join refused: %s",
+            reason,
+            extra={"remote": req.remote, "network_id": net, "token": token[:5] + "…"},
+        )
+        return web.json_response({"ok": False, "reason": reason}, status=403)
+
+    token_entry = chosen["token"]
 
     # Регистрируем нового пира
     new_peer = {
         "name": name,
         "addr": pub_addr,
-        "node_id": "",
+        "node_id": node_id,
         "status": "alive",
         "last_seen": now_s()
     }
 
     peers_list = state.get("peers", [])
-    peers_list.append({"name": name, "addr": pub_addr, "node_id": "", "status": "alive", "last_seen": now_s()})
+    merged = False
+    for p in peers_list:
+        if (node_id and p.get("node_id") == node_id) or p.get("addr") == pub_addr or p.get("name") == name:
+            p.update({k: v for k, v in new_peer.items() if v})
+            merged = True
+            break
+    if not merged:
+        peers_list.append(new_peer)
     set_state("peers", peers_list)
 
     upsert_peer(new_peer)
 
+    # Отмечаем токен использованным
+    try:
+        token_entry["used_by"] = {"node_id": node_id, "name": name, "addr": pub_addr, "ts": nowt}
+    except Exception:
+        token_entry["used_by"] = {"name": name, "addr": pub_addr, "ts": nowt}
+    save_json(INVITES_FILE, invites)
+
     # Обновляем состояние в памяти и на диске
-    print(f"[join] accepted new peer {name} ({pub_addr})")
+    join_logger.info(
+        "[join] accepted new peer",
+        extra={"name": name, "addr": pub_addr, "node_id": node_id[:8], "remote": req.remote},
+    )
     save_json(STATE_FILE, state)
 
     # Рассылаем остальным пинг, чтобы они увидели нового участника
@@ -1114,6 +1227,9 @@ def peers_with_status() -> List[Dict[str, Any]]:
     return out
 
 # --- Network bootstrap (JOIN flow) -----------------------------------------------
+JOIN_REQUIRED = bool(JOIN_URL)
+JOIN_LAST_ERROR: Optional[str] = None
+
 def parse_join_url(u: str) -> Tuple[str, Dict[str, str]]:
     # join://host:port?net=...&token=...&ttl=...
     assert u.startswith("join://")
@@ -1127,6 +1243,7 @@ def parse_join_url(u: str) -> Tuple[str, Dict[str, str]]:
     return host, qs
 
 async def do_join_if_needed():
+    global JOIN_LAST_ERROR
     print("[join] checking join conditions...")
 
     # Если уже есть непустой state -> не делаем join
@@ -1134,39 +1251,48 @@ async def do_join_if_needed():
         try:
             st = load_json(STATE_FILE, {})
             if st.get("network_id"):
-                return
+                JOIN_LAST_ERROR = None
+                return True
         except Exception:
             pass
 
     if not JOIN_URL:
         # режим init — state должен быть уже создан install.sh init-ом
-        return
+        JOIN_LAST_ERROR = None
+        return True
 
     seed, qs = parse_join_url(JOIN_URL)
     net = qs.get("net", "")
     token = qs.get("token", "")
     if not net or not token:
-        print("JOIN_URL missing net/token", file=sys.stderr)
-        return
+        JOIN_LAST_ERROR = "JOIN_URL missing net/token"
+        print(JOIN_LAST_ERROR, file=sys.stderr)
+        return False
 
     payload = {
         "name": SERVER_NAME,
         "token": token,
         "network_id": net,
-        "public_addr": PUBLIC_ADDR,
+        "public_addr": ADVERTISED_ADDR,
+        "node_id": NODE_ID,
     }
 
+    client = await ensure_http_client()
+
     try:
-        async with http_client.post(f"http://{seed}/join", json=payload, timeout=ClientTimeout(total=8)) as r:
+        async with client.post(f"http://{seed}/join", json=payload, timeout=ClientTimeout(total=8)) as r:
             print(f"[join] sending join to {seed}…")
             data = await r.json()
     except Exception as e:
-        print("join error:", e, file=sys.stderr)
-        return
+        JOIN_LAST_ERROR = f"join error: {e}"
+        print(JOIN_LAST_ERROR, file=sys.stderr)
+        return False
 
     if not data.get("ok"):
-        print("join refused:", data, file=sys.stderr)
-        return
+        reason = data.get("reason") or data
+        JOIN_LAST_ERROR = f"join refused: {reason}"
+        print(JOIN_LAST_ERROR, file=sys.stderr)
+        return False
 
     # записываем state
     set_state("network_id", data["network_id"])
@@ -1180,6 +1306,25 @@ async def do_join_if_needed():
         upsert_peer({"name": seed, "addr": seed, "node_id": "", "status": "unknown", "last_seen": 0})
 
     print(f"[join] Joined network {data['network_id']} via {seed}")
+    JOIN_LAST_ERROR = None
+    return True
+
+
+async def join_loop():
+    """Retry join until it succeeds or until network_id is populated.
+
+    When a node is configured with JOIN_URL we never want to auto-promote it
+    to an independent cluster. This loop keeps trying in the background while
+    the rest of the services stay in "joining" mode.
+    """
+
+    backoff = 3.0
+    while JOIN_REQUIRED and not state.get("network_id"):
+        ok = await do_join_if_needed()
+        if ok and state.get("network_id"):
+            break
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 1.5, 60.0)
 
 
 # --- Telegram bot orchestration --------------------------------------------------
@@ -2103,6 +2248,14 @@ async def leader_watcher():
     was_leader = False
     grace_deadline = 0.0
     while True:
+        if JOIN_REQUIRED and not state.get("network_id"):
+            msg = "[leader] waiting for successful join"
+            if JOIN_LAST_ERROR:
+                msg += f" (last_error={JOIN_LAST_ERROR})"
+            print(msg)
+            await asyncio.sleep(2.0)
+            continue
+
         try:
             L = current_leader()
         except Exception as e:
@@ -2249,7 +2402,10 @@ async def on_startup(app):
     await ensure_http_client()
     # Если это init-узел, state уже должен содержать network_id/secret/owner
     # Если join — выполним присоединение
-    await do_join_if_needed()
+    if JOIN_REQUIRED:
+        app['joiner'] = asyncio.create_task(join_loop())
+    else:
+        await do_join_if_needed()
     # Обновим self_peer в state
     upsert_peer(self_peer)
     # Запускаем фоновые циклы
@@ -2261,6 +2417,13 @@ async def on_cleanup(app):
     app['hb'].cancel()
     app['lw'].cancel()
     app['telemetry'].cancel()
+    join_task = app.get('joiner')
+    if join_task:
+        join_task.cancel()
+        try:
+            await join_task
+        except asyncio.CancelledError:
+            pass
     await stop_bot()
     global http_client
     client = http_client

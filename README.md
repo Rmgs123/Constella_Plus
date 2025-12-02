@@ -168,6 +168,7 @@ WireGuard-overlay позволяет прокидывать трафик Constel
 - `VPN_MODE=none` (по умолчанию) — VPN отключён.
 - `VPN_MODE=hub` — публичный VPS поднимает WireGuard (`VPN_INTERFACE_NAME`, `VPN_CIDR`, `VPN_LISTEN_PORT`). Скрипт генерирует ключи и конфиг, но добавление peers пока вручную.
 - `VPN_MODE=client` — узел за NAT подключается к хабу (`VPN_ADDRESS`, `VPN_HUB_ENDPOINT`, `VPN_HUB_PUBLIC_KEY`, опционально `VPN_ALLOWED_IPS`, `VPN_PRESHARED_KEY`).
+- Если WireGuard работает на хосте, а контейнер его не видит, установите `VPN_OVERLAY_TRUST_HOST=1` — приложение возьмёт адрес из `VPN_ADDRESS` и не будет спамить предупреждениями.
 
 Приложение обнаруживает IP интерфейса (`detect_vpn_ip`) и, если `PUBLIC_ADDR` не задан вручную, публикует адрес вида `<vpn_ip>:4747`. Overlay пока **экспериментальный**: требуется ручное управление `wg-quick` и добавлением peers; полноценный mesh и автоматическое распределение ключей находятся в планах развития.
 

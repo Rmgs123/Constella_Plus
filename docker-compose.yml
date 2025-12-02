@@ -17,6 +17,9 @@ x-env-defaults: &env_defaults
     VPN_CIDR: ${VPN_CIDR:-10.42.0.0/24}
     VPN_LISTEN_PORT: ${VPN_LISTEN_PORT:-}
     VPN_HUB_ENDPOINT: ${VPN_HUB_ENDPOINT:-}
+    VPN_ADDRESS: ${VPN_ADDRESS:-}
+    VPN_ALLOWED_IPS: ${VPN_ALLOWED_IPS:-}
+    VPN_OVERLAY_TRUST_HOST: ${VPN_OVERLAY_TRUST_HOST:-0}
 
 services:
   constella:
