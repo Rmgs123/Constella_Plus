@@ -315,6 +315,14 @@ docker image prune -a
 docker volume prune
 docker system prune -a --volumes
 
+wg-quick down wg0 || true
+apt remove --purge -y wireguard wireguard-tools
+rm -rf /etc/wireguard
+rm -rf /usr/lib/modules/*/kernel/net/wireguard 2>/dev/null || true
+
+cd ~/Constella_Plus
+rm -rf state/wg
+
 cd ..
 rm -rf Constella_Plus             # удалит state/ и всю сетевую информацию
 ```
