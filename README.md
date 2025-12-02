@@ -194,6 +194,13 @@ cd Constella_Plus
 
 chmod +x install.sh
 
+apt install -y ufw
+ufw allow 22/tcp
+ufw allow 4747/tcp
+ufw allow 51820/udp
+ufw enable
+ufw status
+
 ./install.sh init \
   --server-name delta-01 \
   --public-addr 203.0.113.10:4747 \
@@ -213,6 +220,13 @@ git clone https://github.com/Rmgs123/Constella_Plus.git
 cd Constella_Plus
 
 chmod +x install.sh
+
+apt install -y ufw
+ufw allow 22/tcp
+ufw allow 4747/tcp
+ufw allow 51820/udp
+ufw enable
+ufw status
 
 ./install.sh join \
   --server-name echo-02 \
