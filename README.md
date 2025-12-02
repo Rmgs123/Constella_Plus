@@ -230,6 +230,9 @@ docker compose logs -f
 **Хаб (публичный VPS):**
 
 ```bash
+apt update
+apt install -y wireguard wireguard-tools
+
 ./install.sh init \
   --server-name hub-01 \
   --public-addr 203.0.113.10:4747 \
@@ -246,6 +249,9 @@ docker compose logs -f
 **Клиент (домашний ПК):**
 
 ```bash
+apt update
+apt install -y wireguard wireguard-tools
+
 ./install.sh join \
   --server-name home-01 \
   --join "join://203.0.113.10:4747?net=abcd1234&token=XYZ&ttl=15m" \
