@@ -645,120 +645,132 @@ async def join(req):
     JOIN: {name, token, network_id, public_addr}
     Ответ: {ok, reason?, network_id, owner_username, network_secret, peers[]}
     """
+    name = ""
+    token = ""
+    net = ""
+    pub_addr = ""
+    node_id = ""
     try:
         data = await req.json()
     except Exception:
         join_logger.warning("/join bad json", extra={"remote": req.remote})
         return web.json_response({"ok": False, "reason": "invalid json"}, status=400)
 
-    name = (data.get("name") or "").strip()
-    token = (data.get("token") or "").strip()
-    net = (data.get("network_id") or "").strip()
-    pub_addr = (data.get("public_addr") or "").strip()
-    node_id = (data.get("node_id") or "").strip()
-
-    missing = [k for k, v in {"name": name, "token": token, "network_id": net, "public_addr": pub_addr}.items() if not v]
-    if missing:
-        reason = f"missing fields: {','.join(missing)}"
-        join_logger.warning(
-            "join refused: %s",
-            reason,
-            extra={"remote": req.remote, "network_id": net, "token": token[:5] + "…"},
-        )
-        return web.json_response({"ok": False, "reason": reason}, status=400)
-
-    if net != state.get("network_id"):
-        join_logger.warning(
-            "join refused: wrong network",
-            extra={"remote": req.remote, "expected": state.get("network_id"), "got": net},
-        )
-        return web.json_response({"ok": False, "reason": "wrong network"}, status=403)
-
-    # проверка токена
-    nowt = now_s()
-    tokens = invites.get("tokens", [])
-    chosen = None
-    keep = []
-    for t in tokens:
-        tok_val = t.get("token")
-        exp_ts = int(t.get("exp_ts", 0) or 0)
-        used_by = t.get("used_by")
-        if tok_val != token:
-            keep.append(t)
-            continue
-        if used_by:
-            chosen = {"ok": False, "reason": "token already used"}
-            keep.append(t)
-            break
-        if exp_ts < nowt:
-            chosen = {"ok": False, "reason": "token expired"}
-            # drop expired token silently
-            continue
-        chosen = {"ok": True, "token": t}
-        keep.append(t)
-        break
-    invites["tokens"] = keep
-    save_json(INVITES_FILE, invites)
-
-    if not chosen or not chosen.get("ok"):
-        reason = chosen.get("reason") if chosen else "unknown token"
-        join_logger.warning(
-            "join refused: %s",
-            reason,
-            extra={"remote": req.remote, "network_id": net, "token": token[:5] + "…"},
-        )
-        return web.json_response({"ok": False, "reason": reason}, status=403)
-
-    token_entry = chosen["token"]
-
-    # Регистрируем нового пира
-    new_peer = {
-        "name": name,
-        "addr": pub_addr,
-        "node_id": node_id,
-        "status": "alive",
-        "last_seen": now_s()
-    }
-
-    peers_list = state.get("peers", [])
-    merged = False
-    for p in peers_list:
-        if (node_id and p.get("node_id") == node_id) or p.get("addr") == pub_addr or p.get("name") == name:
-            p.update({k: v for k, v in new_peer.items() if v})
-            merged = True
-            break
-    if not merged:
-        peers_list.append(new_peer)
-    set_state("peers", peers_list)
-
-    upsert_peer(new_peer)
-
-    # Отмечаем токен использованным
     try:
-        token_entry["used_by"] = {"node_id": node_id, "name": name, "addr": pub_addr, "ts": nowt}
+        name = (data.get("name") or "").strip()
+        token = (data.get("token") or "").strip()
+        net = (data.get("network_id") or "").strip()
+        pub_addr = (data.get("public_addr") or "").strip()
+        node_id = (data.get("node_id") or "").strip()
+
+        missing = [k for k, v in {"name": name, "token": token, "network_id": net, "public_addr": pub_addr}.items() if not v]
+        if missing:
+            reason = f"missing fields: {','.join(missing)}"
+            join_logger.warning(
+                "join refused: %s",
+                reason,
+                extra={"remote": req.remote, "network_id": net, "token": token[:5] + "…"},
+            )
+            return web.json_response({"ok": False, "reason": reason}, status=400)
+
+        if net != state.get("network_id"):
+            join_logger.warning(
+                "join refused: wrong network",
+                extra={"remote": req.remote, "expected": state.get("network_id"), "got": net},
+            )
+            return web.json_response({"ok": False, "reason": "wrong network"}, status=403)
+
+        # проверка токена
+        nowt = now_s()
+        tokens = invites.get("tokens", [])
+        chosen = None
+        keep = []
+        for t in tokens:
+            tok_val = t.get("token")
+            exp_ts = int(t.get("exp_ts", 0) or 0)
+            used_by = t.get("used_by")
+            if tok_val != token:
+                keep.append(t)
+                continue
+            if used_by:
+                chosen = {"ok": False, "reason": "token already used"}
+                keep.append(t)
+                break
+            if exp_ts < nowt:
+                chosen = {"ok": False, "reason": "token expired"}
+                # drop expired token silently
+                continue
+            chosen = {"ok": True, "token": t}
+            keep.append(t)
+            break
+        invites["tokens"] = keep
+        save_json(INVITES_FILE, invites)
+
+        if not chosen or not chosen.get("ok"):
+            reason = chosen.get("reason") if chosen else "unknown token"
+            join_logger.warning(
+                "join refused: %s",
+                reason,
+                extra={"remote": req.remote, "network_id": net, "token": token[:5] + "…"},
+            )
+            return web.json_response({"ok": False, "reason": reason}, status=403)
+
+        token_entry = chosen["token"]
+
+        # Регистрируем нового пира
+        new_peer = {
+            "name": name,
+            "addr": pub_addr,
+            "node_id": node_id,
+            "status": "alive",
+            "last_seen": now_s()
+        }
+
+        peers_list = state.get("peers", [])
+        merged = False
+        for p in peers_list:
+            if (node_id and p.get("node_id") == node_id) or p.get("addr") == pub_addr or p.get("name") == name:
+                p.update({k: v for k, v in new_peer.items() if v})
+                merged = True
+                break
+        if not merged:
+            peers_list.append(new_peer)
+        set_state("peers", peers_list)
+
+        upsert_peer(new_peer)
+
+        # Отмечаем токен использованным
+        try:
+            token_entry["used_by"] = {"node_id": node_id, "name": name, "addr": pub_addr, "ts": nowt}
+        except Exception:
+            token_entry["used_by"] = {"name": name, "addr": pub_addr, "ts": nowt}
+        save_json(INVITES_FILE, invites)
+
+        # Обновляем состояние в памяти и на диске
+        join_logger.info(
+            "[join] accepted new peer",
+            extra={"node_name": name, "addr": pub_addr, "node_id": node_id[:8], "remote": req.remote},
+        )
+        save_json(STATE_FILE, state)
+
+        # Рассылаем остальным пинг, чтобы они увидели нового участника
+        asyncio.create_task(propagate_new_peer(new_peer))
+
+        set_state("join_url", "")
+
+        return web.json_response({
+            "ok": True,
+            "network_id": state.get("network_id"),
+            "owner_username": state.get("owner_username"),
+            "network_secret": state.get("network_secret"),
+            "peers": state.get("peers", [])
+        })
     except Exception:
-        token_entry["used_by"] = {"name": name, "addr": pub_addr, "ts": nowt}
-    save_json(INVITES_FILE, invites)
-
-    # Обновляем состояние в памяти и на диске
-    join_logger.info(
-        "[join] accepted new peer",
-        extra={"name": name, "addr": pub_addr, "node_id": node_id[:8], "remote": req.remote},
-    )
-    save_json(STATE_FILE, state)
-
-    # Рассылаем остальным пинг, чтобы они увидели нового участника
-    asyncio.create_task(propagate_new_peer(new_peer))
-
-    set_state("join_url", "")
-
-    return web.json_response({
-        "ok": True,
-        "network_id": state.get("network_id"),
-        "owner_username": state.get("owner_username"),
-        "network_secret": state.get("network_secret"),
-        "peers": state.get("peers", [])
-    })
+        join_logger.exception(
+            "[join] unexpected error",
+            extra={"remote": req.remote, "node_name": name, "addr": pub_addr, "node_id": node_id[:8] if node_id else ""},
+        )
+        return web.json_response({"ok": False, "reason": "internal error"}, status=500)
 
 @routes.post("/announce")
 async def announce(req):
